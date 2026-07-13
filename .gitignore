@@ -1,0 +1,16 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+bin/
+include/
+lib/
+lib64/
+lib64
+pyvenv.cfg
+__pycache__/
+*.pyc
+*.pyo
+Lib/
+Include/
+Scripts/
+
+# Configuration (includes passwords)
+config.py 
