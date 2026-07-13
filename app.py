@@ -5,8 +5,8 @@ import requests
 app = Flask(__name__)
 
 # --- KONFIGURATION ---
-OPENHAB_URL = "http://localhost:8080"  # Ersetzen Sie dies durch Ihre openHAB-IP
-API_TOKEN = ""  # Falls benötigt, hier Ihren API-Token eintragen
+OPENHAB_URL = "http://localhost:8080"  # Ihre openHAB-IP
+API_TOKEN = ""
 
 
 def get_openhab_items():
@@ -16,7 +16,6 @@ def get_openhab_items():
     headers["Accept"] = "application/json"
 
     try:
-        # Wir holen alle Items inklusive ihrer Gruppen-Mitgliedschaften und Tags
         response = requests.get(
             f"{OPENHAB_URL}/rest/items?fields=name,label,type,groupNames,tags",
             headers=headers,
@@ -30,31 +29,24 @@ def get_openhab_items():
 
 
 def build_semantic_tree(items):
-    # Dictionaries zum schnellen Nachschlagen vorbereiten
-    item_dict = {item["name"]: item for item in items}
     tree = {}
 
-    # 1. Schritt: Alle Gruppen (Locations & Equipments) als Knoten initialisieren
-    for item in items:
+    # 1. Schritt: Nur Items verarbeiten, die überhaupt mindestens ein Tag besitzen!
+    semantic_items = [item for item in items if item.get("tags")]
+    semantic_names = {item["name"] for item in semantic_items}
+
+    for item in semantic_items:
         name = item["name"]
         tags = item.get("tags", [])
 
         # Bestimme den semantischen Typ anhand der Tags
         semantic_type = "None"
+        
+        # Prüfe auf Point-Strukturen (enthalten oft einen Doppelpunkt wie Point:Control)
+        if any(":" in tag for tag in tags):
+            semantic_type = "Point"
+
         for tag in tags:
-            if ":" in tag:
-                # Z.B. "Point:Control" oder "Property:Light"
-                pass
-            elif tag in [
-                "Location",
-                "LivingRoom",
-                "Kitchen",
-                "Bedroom",
-                "GroundFloor",
-                "Corridor",
-                "Bathroom",
-            ]:  # Vereinfachte Erkennung
-                semantic_type = "Location"
             # Standard-openHAB-Tags für Typen abgleichen
             if tag.lower() == "location":
                 semantic_type = "Location"
@@ -62,49 +54,21 @@ def build_semantic_tree(items):
                 semantic_type = "Equipment"
             elif tag.lower() == "point":
                 semantic_type = "Point"
-
-        # Fallback-Erkennung über typische Tag-Muster, falls "Location"/"Equipment" implizit sind
-        if semantic_type == "None":
-            # Wenn es eine Gruppe ist, ist es meist Location oder Equipment
-            if item["type"] == "Group":
-                # Eine sehr grobe Heuristik, falls explizite Tags fehlen:
-                # openHAB setzt bei semantischen Modellen meist explizite Tags wie "LivingRoom" (Location) oder "Lightbulb" (Equipment)
-                # Für diese Demo prüfen wir, ob überhaupt Tags existieren
-                if any(
-                    t
-                    for t in tags
-                    if t
-                    in [
-                        "Location",
-                        "Equipment",
-                        "Point",
-                        "Indoor",
-                        "Outdoor",
-                        "Building",
-                    ]
-                ):
-                    semantic_type = "Location/Equipment"
-                else:
-                    semantic_type = "Equipment"  # Default Annahme für Gruppen
-            else:
-                semantic_type = "Point"
-
-        # Verfeinerung anhand spezifischer openHAB Standard-Semantik-Tags
-        # (Eine vollständige Liste aller Tags würde den Rahmen sprengen, openHAB nutzt z.B. "WallSwitch" für Equipment)
-        for tag in tags:
-            # Wenn ein Location-Tag vorhanden ist
+            
+            # Abgleich gegen bekannte Location-Standard-Tags
             if tag in [
-                "Indoor",
-                "Outdoor",
-                "Building",
-                "Floor",
-                "Room",
-                "LivingRoom",
-                "Kitchen",
-                "Bedroom",
-                "Bathroom",
+                "Indoor", "Outdoor", "Building", "Floor", "Room", 
+                "LivingRoom", "Kitchen", "Bedroom", "Bathroom", "Corridor", "Office"
             ]:
                 semantic_type = "Location"
+
+        # Wenn keine genaue Zuordnung erfolgte, Heuristik anhand des Item-Typs
+        if semantic_type == "None":
+            if item["type"] == "Group":
+                # Wenn es eine Gruppe ist und Location-Tags fehlen, ist es meist Equipment
+                semantic_type = "Equipment"
+            else:
+                semantic_type = "Point"
 
         tree[name] = {
             "name": name,
@@ -117,33 +81,31 @@ def build_semantic_tree(items):
 
     root_nodes = []
 
-    # 2. Schritt: Beziehungen (Parent -> Child) aufbauen
-    for item in items:
+    # 2. Schritt: Beziehungen aufbauen
+    for item in semantic_items:
         name = item["name"]
         group_names = item.get("groupNames", [])
 
-        if not group_names:
-            # Keine übergeordnete Gruppe -> Es ist ein Wurzelknoten (z.B. das Haus oder oberste Etage)
-            # Wir nehmen nur semantische Items in den Hauptbaum auf
+        # Filter: Nur Gruppen-Zugehörigkeiten beachten, die selbst semantische Tags haben
+        valid_groups = [g for g in group_names if g in semantic_names]
+
+        if not valid_groups:
+            # Keine gültige übergeordnete semantische Gruppe -> Wurzelknoten
             root_nodes.append(tree[name])
         else:
-            # Das Item gehört zu einer oder mehreren Gruppen
             orphan = True
-            for group_name in group_names:
+            for group_name in valid_groups:
                 if group_name in tree:
                     tree[group_name]["children"].append(tree[name])
                     orphan = False
-            # Falls die Gruppe nicht im System gefunden wurde, wird es ein Root-Knoten
             if orphan:
                 root_nodes.append(tree[name])
 
-    # Filtern: Wir wollen auf der obersten Ebene primär Locations sehen,
-    # um Nicht-Semantische Items auszublenden, filtern wir leere/irrelevante Wurzeln heraus.
+    # Filtern der Wurzeln: Auf oberster Ebene wollen wir nur echte Locations sehen
     final_tree = [
         node
         for node in root_nodes
         if node["semantic_type"] == "Location"
-        or (node["type"] == "Group" and node["children"])
     ]
 
     return final_tree
@@ -186,15 +148,6 @@ HTML_TEMPLATE = """
             position: relative;
             line-height: 24px;
         }
-        /* Baum-Linien-Effekt */
-        li::before {
-            content: "";
-            position: absolute;
-            top: 0;
-            left: -10px;
-            #border-left: 1px solid #ccc;
-            height: 100%;
-        }
         .caret {
             cursor: pointer;
             user-select: none;
@@ -216,7 +169,6 @@ HTML_TEMPLATE = """
         .active {
             display: block;
         }
-        /* Badges für semantische Typen */
         .badge {
             font-size: 0.75rem;
             padding: 2px 6px;
@@ -238,17 +190,16 @@ HTML_TEMPLATE = """
 <body>
 
 <div class="tree-container">
-    <h1>openHAB Semantic Model</h1>
+    <h1>openHAB Semantic Model (Gefiltert)</h1>
     <div id="tree">Lade Daten aus openHAB...</div>
 </div>
 
 <script>
-    // Daten vom Flask-Backend abrufen
     fetch('/api/tree')
         .then(response => response.json())
         .then(data => {
             const treeContainer = document.getElementById('tree');
-            treeContainer.innerHTML = ''; // Ladehinweis entfernen
+            treeContainer.innerHTML = '';
             
             if(data.length === 0) {
                 treeContainer.innerHTML = "<p>Keine semantischen Daten gefunden. Bitte prüfen Sie Ihre openHAB-Verbindung oder Tags.</p>";
@@ -262,13 +213,11 @@ HTML_TEMPLATE = """
                 spanNode.textContent = node.label;
                 li.appendChild(spanNode);
 
-                // Technische ID anzeigen
                 const spanName = document.createElement('span');
                 spanName.className = 'item-name';
                 spanName.textContent = `(${node.name})`;
                 li.appendChild(spanName);
 
-                // Semantisches Tag als Badge
                 const badge = document.createElement('span');
                 badge.className = `badge ${node.semantic_type}`;
                 badge.textContent = node.semantic_type;
@@ -285,7 +234,6 @@ HTML_TEMPLATE = """
                     
                     li.appendChild(ul);
 
-                    // Klick-Event zum Auf- und Zuklappen
                     spanNode.addEventListener('click', function() {
                         this.parentElement.querySelector('.nested').classList.toggle('active');
                         this.classList.toggle('caret-down');
@@ -324,5 +272,4 @@ def api_tree():
 
 
 if __name__ == "__main__":
-    # Startet den Server lokal auf Port 5000
     app.run(host="0.0.0.0", port=5000, debug=True)
