@@ -5,7 +5,7 @@ import requests
 app = Flask(__name__)
 
 # --- KONFIGURATION ---
-OPENHAB_URL = "http://localhost:8080"  # Ihre openHAB-IP
+OPENHAB_URL = "http://localhost:8080"  # Ersetzen Sie dies durch Ihre openHAB-IP
 API_TOKEN = ""
 
 
@@ -31,42 +31,65 @@ def get_openhab_items():
 def build_semantic_tree(items):
     tree = {}
 
-    # 1. Schritt: Nur Items verarbeiten, die überhaupt mindestens ein Tag besitzen!
+    # 1. Schritt: Nur Items verarbeiten, die überhaupt mindestens ein Tag besitzen
     semantic_items = [item for item in items if item.get("tags")]
     semantic_names = {item["name"] for item in semantic_items}
+
+    # Bekannte Core-Begriffe zur Abgrenzung
+    core_locations = {"indoor", "outdoor", "building", "floor", "room", "livingroom", "kitchen", "bedroom", "bathroom", "corridor", "office"}
+    core_equipments = {"equipment", "lightbulb", "wallswitch", "whitegoods", "hvac", "networkdevice"}
 
     for item in semantic_items:
         name = item["name"]
         tags = item.get("tags", [])
 
-        # Bestimme den semantischen Typ anhand der Tags
         semantic_type = "None"
         
-        # Prüfe auf Point-Strukturen (enthalten oft einen Doppelpunkt wie Point:Control)
-        if any(":" in tag for tag in tags):
-            semantic_type = "Point"
-
+        # 1. Präzise Analyse strukturierter Tags (z.B. "Point:Control" oder "Property:Light")
         for tag in tags:
-            # Standard-openHAB-Tags für Typen abgleichen
-            if tag.lower() == "location":
-                semantic_type = "Location"
-            elif tag.lower() == "equipment":
-                semantic_type = "Equipment"
-            elif tag.lower() == "point":
-                semantic_type = "Point"
-            
-            # Abgleich gegen bekannte Location-Standard-Tags
-            if tag in [
-                "Indoor", "Outdoor", "Building", "Floor", "Room", 
-                "LivingRoom", "Kitchen", "Bedroom", "Bathroom", "Corridor", "Office"
-            ]:
-                semantic_type = "Location"
+            if ":" in tag:
+                prefix = tag.split(":")[0].lower()
+                if prefix in ["point", "property"]:
+                    semantic_type = "Point"
+                    break
 
-        # Wenn keine genaue Zuordnung erfolgte, Heuristik anhand des Item-Typs
+        # 2. Analyse flacher Core- oder Custom-Tags
+        if semantic_type == "None":
+            for tag in tags:
+                tag_lower = tag.lower()
+                
+                # Explizite Core-Typen abgleichen
+                if tag_lower == "location":
+                    semantic_type = "Location"
+                    break
+                elif tag_lower == "equipment":
+                    semantic_type = "Equipment"
+                    break
+                elif tag_lower == "point":
+                    semantic_type = "Point"
+                    break
+                
+                # Abgleich gegen bekannte Core-Locations oder gängige Raum-Namensmuster (auch Custom)
+                if tag_lower in core_locations or "room" in tag_lower or "floor" in tag_lower or "building" in tag_lower:
+                    semantic_type = "Location"
+                    break
+                # Abgleich gegen bekannte Core-Equipments
+                elif tag_lower in core_equipments:
+                    semantic_type = "Equipment"
+                    break
+
+        # 3. Universeller Fallback für komplexe Custom Tags basierend auf der openHAB-Struktur
         if semantic_type == "None":
             if item["type"] == "Group":
-                # Wenn es eine Gruppe ist und Location-Tags fehlen, ist es meist Equipment
-                semantic_type = "Equipment"
+                # Wenn es eine Gruppe ist, prüfen wir, ob der Name oder das Label auf einen Raum hindeutet
+                label_lower = (item.get("label") or "").lower()
+                name_lower = name.lower()
+                
+                if any(x in label_lower or x in name_lower for x in ["zimmer", "raum", "bad", "küche", "balkon", "konferenz"]):
+                    semantic_type = "Location"
+                else:
+                    # Ansonsten standardmäßig als übergeordnetes Custom Equipment einordnen
+                    semantic_type = "Equipment"
             else:
                 semantic_type = "Point"
 
@@ -81,16 +104,15 @@ def build_semantic_tree(items):
 
     root_nodes = []
 
-    # 2. Schritt: Beziehungen aufbauen
+    # 2. Schritt: Beziehungen (Parent -> Child) aufbauen
     for item in semantic_items:
         name = item["name"]
         group_names = item.get("groupNames", [])
 
-        # Filter: Nur Gruppen-Zugehörigkeiten beachten, die selbst semantische Tags haben
+        # Nur Gruppen-Zugehörigkeiten beachten, die selbst im semantischen Modell sind
         valid_groups = [g for g in group_names if g in semantic_names]
 
         if not valid_groups:
-            # Keine gültige übergeordnete semantische Gruppe -> Wurzelknoten
             root_nodes.append(tree[name])
         else:
             orphan = True
@@ -111,7 +133,7 @@ def build_semantic_tree(items):
     return final_tree
 
 
-# --- HTML/JS FRONTEND (Inlined für einfache Ausführung) ---
+# --- HTML/JS FRONTEND ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="de">
