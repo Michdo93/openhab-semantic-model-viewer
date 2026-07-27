@@ -19,28 +19,50 @@ tags_api = Tags(client)
 
 # =====================================================================
 # TAG-REGISTRY: klassifiziert jeden Tag-Namen als Location/Equipment/
-# Point/Property über die echte openHAB-Hierarchie (/rest/tags), statt
-# aus Namen/Labels zu raten. Voraussetzung: Tags sind korrekt gesetzt
-# (z.B. über HABot oder die Item-Settings-UI).
+# Point/Property über die echte openHAB-Hierarchie (/rest/tags).
+#
+# WICHTIG (Fix ggü. Vorversion): Wir wissen nicht mit Sicherheit, ob
+# /rest/tags qualifizierte UIDs wie "Location_Kitchen" oder kurze Namen
+# wie "Kitchen" liefert -- und ob deine Items dieselbe Schreibweise auf
+# ihren "tags" tragen. Bisher haben wir das einfach angenommen, und genau
+# das war vermutlich der Grund für den leeren Baum. Jetzt wird JEDER Tag
+# unter BEIDEM registriert (voller Name + kurzer Name nach dem letzten
+# "_"), und beim Klassifizieren eines Item-Tags wird zuerst exakt, dann
+# über den Kurznamen gesucht -- funktioniert unabhängig davon, welche der
+# beiden Schreibweisen dein System tatsächlich benutzt.
 # =====================================================================
 _tag_parent = {}
+_short_to_uid = {}
+_raw_tags_sample = []
 ROOT_CATEGORIES = {"Location", "Equipment", "Point", "Property"}
 
 
 def load_tag_registry():
-    global _tag_parent
+    global _tag_parent, _short_to_uid, _raw_tags_sample
     _tag_parent = {}
+    _short_to_uid = {}
     try:
         tags = tags_api.getTags(language="de")
         if not isinstance(tags, list):
             print(f"Warnung: Tags.getTags() lieferte kein verwertbares Ergebnis: {tags!r}")
             return
+        # Bewusst nicht einfach tags[:5] -- ein Root-Tag allein (ohne
+        # Parent) verrät nichts über das Feldformat von Kindern. Wir
+        # nehmen zusätzlich gezielt ein paar Nicht-Root-Einträge mit.
+        root_sample = [t for t in tags if (t.get("uid") or t.get("name")) in ROOT_CATEGORIES][:2]
+        non_root_sample = [t for t in tags if (t.get("uid") or t.get("name")) not in ROOT_CATEGORIES][:5]
+        _raw_tags_sample = root_sample + non_root_sample
         for t in tags:
-            uid = t.get("uid") or t.get("name")
+            uid = t.get("uid") or t.get("name") or t.get("id")
             if not uid:
                 continue
-            _tag_parent[uid] = t.get("parentTag") or t.get("parent")
+            parent = t.get("parentTag") or t.get("parent")
+            _tag_parent[uid] = parent
+            short = uid.split("_")[-1] if "_" in uid else uid
+            _short_to_uid.setdefault(short, uid)
         print(f"[TAGS] {len(tags)} Tags geladen.")
+        if tags:
+            print(f"[TAGS] Beispiel-Eintrag (roh, zur Kontrolle des Feldformats): {tags[0]!r}")
     except Exception as e:
         print(f"Warnung: Tag-Registry konnte nicht geladen werden: {e}")
 
@@ -48,21 +70,43 @@ def load_tag_registry():
 _category_cache = {}
 
 
+def _resolve_uid(tag_name):
+    """Findet den Registry-Key zu einem rohen Item-Tag: zuerst exakt,
+    dann über die Kurzname-Tabelle (s. Kommentar oben)."""
+    if tag_name in ROOT_CATEGORIES or tag_name in _tag_parent:
+        return tag_name
+    return _short_to_uid.get(tag_name)
+
+
 def tag_category(tag_name):
     """Läuft die Parent-Kette eines Tags hoch bis zu einer der vier
-    Wurzelkategorien. z.B. 'Bathroom' -> 'Location', 'Lightbulb' -> 'Equipment'."""
+    Wurzelkategorien. z.B. 'Bathroom'/'Location_Bathroom' -> 'Location'."""
     if tag_name in _category_cache:
         return _category_cache[tag_name]
+    uid = _resolve_uid(tag_name)
+    if not uid:
+        _category_cache[tag_name] = None
+        return None
+
+    # Versuch 1: über das parentTag-Feld hochlaufen (falls vorhanden/gepflegt).
     seen = set()
-    current = tag_name
+    current = uid
     while current and current not in seen:
         if current in ROOT_CATEGORIES:
             _category_cache[tag_name] = current
             return current
         seen.add(current)
         current = _tag_parent.get(current)
-    _category_cache[tag_name] = None
-    return None
+
+    # Versuch 2 (Fallback): dein System liefert offenbar KEIN befülltes
+    # parentTag-Feld (siehe /api/debug: das Root-Tag 'Equipment' hat den
+    # Key gar nicht erst). openHAB kodiert die Hierarchie stattdessen direkt
+    # im UID-String, z.B. "Location_Indoor_Room_Bathroom" -- das erste
+    # Segment ist dann unmittelbar die Wurzelkategorie.
+    first_segment = uid.split("_")[0]
+    result = first_segment if first_segment in ROOT_CATEGORIES else None
+    _category_cache[tag_name] = result
+    return result
 
 
 def classify_item(tags):
@@ -124,9 +168,7 @@ def build_semantic_tree(items):
     def nearest_semantic_ancestor(item):
         """Läuft die groupNames-Kette hoch (BFS), bis eine Gruppe gefunden
         wird, die SELBST semantisch getaggt ist. Überspringt dabei rein
-        organisatorische Zwischen-Gruppen ohne eigenes Tag -- z.B. einen
-        'Bewegungsmelder'-Wrapper, der nur zur Übersicht dient und selbst
-        kein Equipment/Location ist."""
+        organisatorische Zwischen-Gruppen ohne eigenes Tag."""
         visited = set()
         frontier = list(item.get("groupNames", []))
         while frontier:
@@ -152,7 +194,6 @@ def build_semantic_tree(items):
         else:
             root_nodes.append(tree[name])
 
-    # Nur Locations sollen auf oberster Ebene erscheinen.
     return [node for node in root_nodes if node["semantic_type"] == "Location"]
 
 
@@ -235,6 +276,11 @@ HTML_TEMPLATE = """
             color: #7f8c8d;
             margin-left: 5px;
         }
+        .debug-link {
+            display: block;
+            margin-top: 15px;
+            font-size: 0.85rem;
+        }
     </style>
 </head>
 <body>
@@ -242,6 +288,7 @@ HTML_TEMPLATE = """
 <div class="tree-container">
     <h1>openHAB Semantic Model</h1>
     <div id="tree">Lade Daten aus openHAB...</div>
+    <a class="debug-link" href="/api/debug" target="_blank">→ /api/debug (Rohdaten zur Fehlersuche)</a>
 </div>
 
 <script>
@@ -252,7 +299,7 @@ HTML_TEMPLATE = """
             treeContainer.innerHTML = '';
 
             if(data.length === 0) {
-                treeContainer.innerHTML = "<p>Keine semantischen Daten gefunden. Bitte prüfen Sie Ihre openHAB-Verbindung oder Tags.</p>";
+                treeContainer.innerHTML = "<p>Keine semantischen Daten gefunden. Siehe /api/debug für Details.</p>";
                 return;
             }
 
@@ -330,10 +377,38 @@ def api_tree():
 
 @app.route("/api/reload_tags")
 def reload_tags():
-    """Manuelles Neuladen der Tag-Registry, falls du in openHAB neue
-    Custom-Tags angelegt hast, ohne den Flask-Prozess neu zu starten."""
     load_tag_registry()
     return jsonify({"status": "ok", "tags_loaded": len(_tag_parent)})
+
+
+@app.route("/api/debug")
+def debug():
+    """Zeigt genau das, was wir zur Fehlersuche brauchen, statt weiter zu
+    raten: wie /rest/tags wirklich aussieht, und wie ein paar echte Items
+    damit klassifiziert werden (oder eben nicht)."""
+    raw_items = get_openhab_items()
+    sample = []
+    for item in raw_items:
+        tags = item.get("tags", [])
+        if not tags:
+            continue
+        semantic_type, property_name = classify_item(tags)
+        sample.append({
+            "name": item.get("name"),
+            "type": item.get("type"),
+            "raw_tags": tags,
+            "classified_as": semantic_type,
+            "property": property_name,
+        })
+        if len(sample) >= 20:
+            break
+
+    return jsonify({
+        "tag_registry_entries": len(_tag_parent),
+        "raw_tags_sample": _raw_tags_sample,
+        "items_total": len(raw_items),
+        "items_with_tags_sample": sample,
+    })
 
 
 if __name__ == "__main__":
