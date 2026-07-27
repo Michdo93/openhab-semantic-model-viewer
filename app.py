@@ -1,136 +1,159 @@
 import os
 from flask import Flask, render_template_string, jsonify
-import requests
+from dotenv import load_dotenv
+
+# python-openhab-rest-client (dieselbe Library wie in der oh-ai-bridge)
+from openhab import OpenHABClient, Items, Tags
+
+load_dotenv()
 
 app = Flask(__name__)
 
-# --- KONFIGURATION ---
-OPENHAB_URL = "http://localhost:8080"  # Ersetzen Sie dies durch Ihre openHAB-IP
-API_TOKEN = ""
+# --- KONFIGURATION (.env statt Klartext-Credentials im Code) ---
+OPENHAB_URL = os.getenv("OPENHAB_URL", "http://127.0.0.1:8080")
+OPENHAB_TOKEN = os.getenv("OPENHAB_TOKEN", "")
+
+client = OpenHABClient(url=OPENHAB_URL, token=OPENHAB_TOKEN or None)
+items_api = Items(client)
+tags_api = Tags(client)
+
+# =====================================================================
+# TAG-REGISTRY: klassifiziert jeden Tag-Namen als Location/Equipment/
+# Point/Property über die echte openHAB-Hierarchie (/rest/tags), statt
+# aus Namen/Labels zu raten. Voraussetzung: Tags sind korrekt gesetzt
+# (z.B. über HABot oder die Item-Settings-UI).
+# =====================================================================
+_tag_parent = {}
+ROOT_CATEGORIES = {"Location", "Equipment", "Point", "Property"}
+
+
+def load_tag_registry():
+    global _tag_parent
+    _tag_parent = {}
+    try:
+        tags = tags_api.getTags(language="de")
+        if not isinstance(tags, list):
+            print(f"Warnung: Tags.getTags() lieferte kein verwertbares Ergebnis: {tags!r}")
+            return
+        for t in tags:
+            uid = t.get("uid") or t.get("name")
+            if not uid:
+                continue
+            _tag_parent[uid] = t.get("parentTag") or t.get("parent")
+        print(f"[TAGS] {len(tags)} Tags geladen.")
+    except Exception as e:
+        print(f"Warnung: Tag-Registry konnte nicht geladen werden: {e}")
+
+
+_category_cache = {}
+
+
+def tag_category(tag_name):
+    """Läuft die Parent-Kette eines Tags hoch bis zu einer der vier
+    Wurzelkategorien. z.B. 'Bathroom' -> 'Location', 'Lightbulb' -> 'Equipment'."""
+    if tag_name in _category_cache:
+        return _category_cache[tag_name]
+    seen = set()
+    current = tag_name
+    while current and current not in seen:
+        if current in ROOT_CATEGORIES:
+            _category_cache[tag_name] = current
+            return current
+        seen.add(current)
+        current = _tag_parent.get(current)
+    _category_cache[tag_name] = None
+    return None
+
+
+def classify_item(tags):
+    """Ordnet ein Item über seine ECHTEN Tags einer Kategorie zu.
+    Gibt (semantic_type, property_name) zurück -- property_name nur bei
+    Point gesetzt, wenn zusätzlich ein Property-Tag (z.B. 'Light') vorhanden
+    ist. Kein Tag klassifizierbar -> (None, None), Item taucht im Baum
+    dann nicht auf (kein Rate-Fallback mehr auf Name/Label!)."""
+    point_found = False
+    property_name = None
+    for t in tags:
+        cat = tag_category(t)
+        if cat == "Location":
+            return "Location", None
+        if cat == "Equipment":
+            return "Equipment", None
+        if cat == "Point":
+            point_found = True
+        elif cat == "Property":
+            property_name = t
+    if point_found or property_name:
+        return "Point", property_name
+    return None, None
 
 
 def get_openhab_items():
-    headers = {}
-    if API_TOKEN:
-        headers["Authorization"] = f"Bearer {API_TOKEN}"
-    headers["Accept"] = "application/json"
-
     try:
-        response = requests.get(
-            f"{OPENHAB_URL}/rest/items?fields=name,label,type,groupNames,tags",
-            headers=headers,
-            timeout=10,
-        )
-        response.raise_for_status()
-        return response.json()
+        items = items_api.getItems(fields="name,label,type,groupNames,tags")
+        if isinstance(items, dict) and "error" in items:
+            print(f"Fehler beim Abrufen der openHAB REST API: {items['error']}")
+            return []
+        if not isinstance(items, list):
+            print(f"Unerwartetes Antwortformat von Items.getItems(): {items!r}")
+            return []
+        return items
     except Exception as e:
         print(f"Fehler beim Abrufen der openHAB REST API: {e}")
         return []
 
 
 def build_semantic_tree(items):
+    items_by_name = {i["name"]: i for i in items}
     tree = {}
 
-    # 1. Schritt: Nur Items verarbeiten, die überhaupt mindestens ein Tag besitzen
-    semantic_items = [item for item in items if item.get("tags")]
-    semantic_names = {item["name"] for item in semantic_items}
-
-    # Bekannte Core-Begriffe zur Abgrenzung
-    core_locations = {"indoor", "outdoor", "building", "floor", "room", "livingroom", "kitchen", "bedroom", "bathroom", "corridor", "office"}
-    core_equipments = {"equipment", "lightbulb", "wallswitch", "whitegoods", "hvac", "networkdevice"}
-
-    for item in semantic_items:
-        name = item["name"]
-        tags = item.get("tags", [])
-
-        semantic_type = "None"
-        
-        # 1. Präzise Analyse strukturierter Tags (z.B. "Point:Control" oder "Property:Light")
-        for tag in tags:
-            if ":" in tag:
-                prefix = tag.split(":")[0].lower()
-                if prefix in ["point", "property"]:
-                    semantic_type = "Point"
-                    break
-
-        # 2. Analyse flacher Core- oder Custom-Tags
-        if semantic_type == "None":
-            for tag in tags:
-                tag_lower = tag.lower()
-                
-                # Explizite Core-Typen abgleichen
-                if tag_lower == "location":
-                    semantic_type = "Location"
-                    break
-                elif tag_lower == "equipment":
-                    semantic_type = "Equipment"
-                    break
-                elif tag_lower == "point":
-                    semantic_type = "Point"
-                    break
-                
-                # Abgleich gegen bekannte Core-Locations oder gängige Raum-Namensmuster (auch Custom)
-                if tag_lower in core_locations or "room" in tag_lower or "floor" in tag_lower or "building" in tag_lower:
-                    semantic_type = "Location"
-                    break
-                # Abgleich gegen bekannte Core-Equipments
-                elif tag_lower in core_equipments:
-                    semantic_type = "Equipment"
-                    break
-
-        # 3. Universeller Fallback für komplexe Custom Tags basierend auf der openHAB-Struktur
-        if semantic_type == "None":
-            if item["type"] == "Group":
-                # Wenn es eine Gruppe ist, prüfen wir, ob der Name oder das Label auf einen Raum hindeutet
-                label_lower = (item.get("label") or "").lower()
-                name_lower = name.lower()
-                
-                if any(x in label_lower or x in name_lower for x in ["zimmer", "raum", "bad", "küche", "balkon", "konferenz"]):
-                    semantic_type = "Location"
-                else:
-                    # Ansonsten standardmäßig als übergeordnetes Custom Equipment einordnen
-                    semantic_type = "Equipment"
-            else:
-                semantic_type = "Point"
-
-        tree[name] = {
-            "name": name,
-            "label": item.get("label") or name,
+    for item in items:
+        semantic_type, property_name = classify_item(item.get("tags", []))
+        if semantic_type is None:
+            continue
+        tree[item["name"]] = {
+            "name": item["name"],
+            "label": item.get("label") or item["name"],
             "type": item["type"],
             "semantic_type": semantic_type,
-            "tags": tags,
+            "property": property_name,
+            "tags": item.get("tags", []),
             "children": [],
         }
 
+    def nearest_semantic_ancestor(item):
+        """Läuft die groupNames-Kette hoch (BFS), bis eine Gruppe gefunden
+        wird, die SELBST semantisch getaggt ist. Überspringt dabei rein
+        organisatorische Zwischen-Gruppen ohne eigenes Tag -- z.B. einen
+        'Bewegungsmelder'-Wrapper, der nur zur Übersicht dient und selbst
+        kein Equipment/Location ist."""
+        visited = set()
+        frontier = list(item.get("groupNames", []))
+        while frontier:
+            gname = frontier.pop(0)
+            if gname in visited:
+                continue
+            visited.add(gname)
+            if gname in tree:
+                return gname
+            parent_item = items_by_name.get(gname)
+            if parent_item:
+                frontier.extend(parent_item.get("groupNames", []))
+        return None
+
     root_nodes = []
-
-    # 2. Schritt: Beziehungen (Parent -> Child) aufbauen
-    for item in semantic_items:
+    for item in items:
         name = item["name"]
-        group_names = item.get("groupNames", [])
-
-        # Nur Gruppen-Zugehörigkeiten beachten, die selbst im semantischen Modell sind
-        valid_groups = [g for g in group_names if g in semantic_names]
-
-        if not valid_groups:
-            root_nodes.append(tree[name])
+        if name not in tree:
+            continue
+        ancestor_name = nearest_semantic_ancestor(item)
+        if ancestor_name and ancestor_name in tree:
+            tree[ancestor_name]["children"].append(tree[name])
         else:
-            orphan = True
-            for group_name in valid_groups:
-                if group_name in tree:
-                    tree[group_name]["children"].append(tree[name])
-                    orphan = False
-            if orphan:
-                root_nodes.append(tree[name])
+            root_nodes.append(tree[name])
 
-    # Filtern der Wurzeln: Auf oberster Ebene wollen wir nur echte Locations sehen
-    final_tree = [
-        node
-        for node in root_nodes
-        if node["semantic_type"] == "Location"
-    ]
-
-    return final_tree
+    # Nur Locations sollen auf oberster Ebene erscheinen.
+    return [node for node in root_nodes if node["semantic_type"] == "Location"]
 
 
 # --- HTML/JS FRONTEND ---
@@ -202,6 +225,11 @@ HTML_TEMPLATE = """
         .Location { background-color: #2ecc71; color: white; }
         .Equipment { background-color: #f1c40f; color: #333; }
         .Point { background-color: #3498db; color: white; }
+        .property-tag {
+            font-size: 0.75rem;
+            color: #8e44ad;
+            margin-left: 6px;
+        }
         .item-name {
             font-size: 0.85rem;
             color: #7f8c8d;
@@ -212,7 +240,7 @@ HTML_TEMPLATE = """
 <body>
 
 <div class="tree-container">
-    <h1>openHAB Semantic Model (Gefiltert)</h1>
+    <h1>openHAB Semantic Model</h1>
     <div id="tree">Lade Daten aus openHAB...</div>
 </div>
 
@@ -222,7 +250,7 @@ HTML_TEMPLATE = """
         .then(data => {
             const treeContainer = document.getElementById('tree');
             treeContainer.innerHTML = '';
-            
+
             if(data.length === 0) {
                 treeContainer.innerHTML = "<p>Keine semantischen Daten gefunden. Bitte prüfen Sie Ihre openHAB-Verbindung oder Tags.</p>";
                 return;
@@ -230,7 +258,7 @@ HTML_TEMPLATE = """
 
             function renderNode(node) {
                 const li = document.createElement('li');
-                
+
                 const spanNode = document.createElement('span');
                 spanNode.textContent = node.label;
                 li.appendChild(spanNode);
@@ -245,15 +273,22 @@ HTML_TEMPLATE = """
                 badge.textContent = node.semantic_type;
                 li.appendChild(badge);
 
+                if (node.property) {
+                    const prop = document.createElement('span');
+                    prop.className = 'property-tag';
+                    prop.textContent = `(${node.property})`;
+                    li.appendChild(prop);
+                }
+
                 if (node.children && node.children.length > 0) {
                     spanNode.className = 'caret';
                     const ul = document.createElement('ul');
                     ul.className = 'nested';
-                    
+
                     node.children.forEach(child => {
                         ul.appendChild(renderNode(child));
                     });
-                    
+
                     li.appendChild(ul);
 
                     spanNode.addEventListener('click', function() {
@@ -261,7 +296,7 @@ HTML_TEMPLATE = """
                         this.classList.toggle('caret-down');
                     });
                 }
-                
+
                 return li;
             }
 
@@ -293,5 +328,14 @@ def api_tree():
     return jsonify(semantic_tree)
 
 
+@app.route("/api/reload_tags")
+def reload_tags():
+    """Manuelles Neuladen der Tag-Registry, falls du in openHAB neue
+    Custom-Tags angelegt hast, ohne den Flask-Prozess neu zu starten."""
+    load_tag_registry()
+    return jsonify({"status": "ok", "tags_loaded": len(_tag_parent)})
+
+
 if __name__ == "__main__":
+    load_tag_registry()
     app.run(host="0.0.0.0", port=5000, debug=True)
