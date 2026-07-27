@@ -1,416 +1,344 @@
 import os
+import requests
 from flask import Flask, render_template_string, jsonify
 from dotenv import load_dotenv
-
-# python-openhab-rest-client (dieselbe Library wie in der oh-ai-bridge)
-from openhab import OpenHABClient, Items, Tags
 
 load_dotenv()
 
 app = Flask(__name__)
 
-# --- KONFIGURATION (.env statt Klartext-Credentials im Code) ---
+# --- Konfiguration ---
 OPENHAB_URL = os.getenv("OPENHAB_URL", "http://127.0.0.1:8080")
 OPENHAB_TOKEN = os.getenv("OPENHAB_TOKEN", "")
 
-client = OpenHABClient(url=OPENHAB_URL, token=OPENHAB_TOKEN or None)
-items_api = Items(client)
-tags_api = Tags(client)
 
-# =====================================================================
-# TAG-REGISTRY: klassifiziert jeden Tag-Namen als Location/Equipment/
-# Point/Property über die echte openHAB-Hierarchie (/rest/tags).
-#
-# WICHTIG (Fix ggü. Vorversion): Wir wissen nicht mit Sicherheit, ob
-# /rest/tags qualifizierte UIDs wie "Location_Kitchen" oder kurze Namen
-# wie "Kitchen" liefert -- und ob deine Items dieselbe Schreibweise auf
-# ihren "tags" tragen. Bisher haben wir das einfach angenommen, und genau
-# das war vermutlich der Grund für den leeren Baum. Jetzt wird JEDER Tag
-# unter BEIDEM registriert (voller Name + kurzer Name nach dem letzten
-# "_"), und beim Klassifizieren eines Item-Tags wird zuerst exakt, dann
-# über den Kurznamen gesucht -- funktioniert unabhängig davon, welche der
-# beiden Schreibweisen dein System tatsächlich benutzt.
-# =====================================================================
-_tag_parent = {}
-_short_to_uid = {}
-_raw_tags_sample = []
-ROOT_CATEGORIES = {"Location", "Equipment", "Point", "Property"}
-
-
-def load_tag_registry():
-    global _tag_parent, _short_to_uid, _raw_tags_sample
-    _tag_parent = {}
-    _short_to_uid = {}
+def fetch_raw_items_from_api():
+    """Holt die Items inklusive Semantik-Metadaten direkt von openHAB."""
+    url = f"{OPENHAB_URL}/rest/items?recursive=false&metadata=semantics"
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {OPENHAB_TOKEN}" if OPENHAB_TOKEN else ""
+    }
+    
     try:
-        tags = tags_api.getTags(language="de")
-        if not isinstance(tags, list):
-            print(f"Warnung: Tags.getTags() lieferte kein verwertbares Ergebnis: {tags!r}")
-            return
-        # Bewusst nicht einfach tags[:5] -- ein Root-Tag allein (ohne
-        # Parent) verrät nichts über das Feldformat von Kindern. Wir
-        # nehmen zusätzlich gezielt ein paar Nicht-Root-Einträge mit.
-        root_sample = [t for t in tags if (t.get("uid") or t.get("name")) in ROOT_CATEGORIES][:2]
-        non_root_sample = [t for t in tags if (t.get("uid") or t.get("name")) not in ROOT_CATEGORIES][:5]
-        _raw_tags_sample = root_sample + non_root_sample
-        for t in tags:
-            uid = t.get("uid") or t.get("name") or t.get("id")
-            if not uid:
-                continue
-            parent = t.get("parentTag") or t.get("parent")
-            _tag_parent[uid] = parent
-            short = uid.split("_")[-1] if "_" in uid else uid
-            _short_to_uid.setdefault(short, uid)
-        print(f"[TAGS] {len(tags)} Tags geladen.")
-        if tags:
-            print(f"[TAGS] Beispiel-Eintrag (roh, zur Kontrolle des Feldformats): {tags[0]!r}")
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        return response.json()
     except Exception as e:
-        print(f"Warnung: Tag-Registry konnte nicht geladen werden: {e}")
-
-
-_category_cache = {}
-
-
-def _resolve_uid(tag_name):
-    """Findet den Registry-Key zu einem rohen Item-Tag: zuerst exakt,
-    dann über die Kurzname-Tabelle (s. Kommentar oben)."""
-    if tag_name in ROOT_CATEGORIES or tag_name in _tag_parent:
-        return tag_name
-    return _short_to_uid.get(tag_name)
-
-
-def tag_category(tag_name):
-    """Läuft die Parent-Kette eines Tags hoch bis zu einer der vier
-    Wurzelkategorien. z.B. 'Bathroom'/'Location_Bathroom' -> 'Location'."""
-    if tag_name in _category_cache:
-        return _category_cache[tag_name]
-    uid = _resolve_uid(tag_name)
-    if not uid:
-        _category_cache[tag_name] = None
+        print(f"Fehler bei der Kommunikation mit openHAB: {e}")
         return None
 
-    # Versuch 1: über das parentTag-Feld hochlaufen (falls vorhanden/gepflegt).
-    seen = set()
-    current = uid
-    while current and current not in seen:
-        if current in ROOT_CATEGORIES:
-            _category_cache[tag_name] = current
-            return current
-        seen.add(current)
-        current = _tag_parent.get(current)
 
-    # Versuch 2 (Fallback): dein System liefert offenbar KEIN befülltes
-    # parentTag-Feld (siehe /api/debug: das Root-Tag 'Equipment' hat den
-    # Key gar nicht erst). openHAB kodiert die Hierarchie stattdessen direkt
-    # im UID-String, z.B. "Location_Indoor_Room_Bathroom" -- das erste
-    # Segment ist dann unmittelbar die Wurzelkategorie.
-    first_segment = uid.split("_")[0]
-    result = first_segment if first_segment in ROOT_CATEGORIES else None
-    _category_cache[tag_name] = result
-    return result
+def build_semantic_tree():
+    """Baut den semantischen Baum direkt aus den live abgerufenen Daten auf."""
+    raw_items = fetch_raw_items_from_api()
+    if raw_items is None:
+        return {"error": "Verbindung zu openHAB fehlgeschlagen. Bitte URL und Token prüfen."}
 
+    items_dict = {item["name"]: item for item in raw_items}
+    nodes = {}
 
-def classify_item(tags):
-    """Ordnet ein Item über seine ECHTEN Tags einer Kategorie zu.
-    Gibt (semantic_type, property_name) zurück -- property_name nur bei
-    Point gesetzt, wenn zusätzlich ein Property-Tag (z.B. 'Light') vorhanden
-    ist. Kein Tag klassifizierbar -> (None, None), Item taucht im Baum
-    dann nicht auf (kein Rate-Fallback mehr auf Name/Label!)."""
-    point_found = False
-    property_name = None
-    for t in tags:
-        cat = tag_category(t)
-        if cat == "Location":
-            return "Location", None
-        if cat == "Equipment":
-            return "Equipment", None
-        if cat == "Point":
-            point_found = True
-        elif cat == "Property":
-            property_name = t
-    if point_found or property_name:
-        return "Point", property_name
-    return None, None
+    # 1. Alle semantischen Knoten identifizieren
+    for name, item in items_dict.items():
+        semantics = item.get("metadata", {}).get("semantics", {})
+        sem_value = semantics.get("value")
 
+        if not sem_value:
+            continue  # Nicht-semantische Items ignorieren
 
-def get_openhab_items():
-    try:
-        items = items_api.getItems(fields="name,label,type,groupNames,tags")
-        if isinstance(items, dict) and "error" in items:
-            print(f"Fehler beim Abrufen der openHAB REST API: {items['error']}")
-            return []
-        if not isinstance(items, list):
-            print(f"Unerwartetes Antwortformat von Items.getItems(): {items!r}")
-            return []
-        return items
-    except Exception as e:
-        print(f"Fehler beim Abrufen der openHAB REST API: {e}")
-        return []
+        sem_type = sem_value.split("_")[0]  # "Location", "Equipment" oder "Point"
 
-
-def build_semantic_tree(items):
-    items_by_name = {i["name"]: i for i in items}
-    tree = {}
-
-    for item in items:
-        semantic_type, property_name = classify_item(item.get("tags", []))
-        if semantic_type is None:
-            continue
-        tree[item["name"]] = {
-            "name": item["name"],
-            "label": item.get("label") or item["name"],
-            "type": item["type"],
-            "semantic_type": semantic_type,
-            "property": property_name,
-            "tags": item.get("tags", []),
-            "children": [],
+        nodes[name] = {
+            "name": name,
+            "label": item.get("label", name),
+            "type": item.get("type", "Group"),
+            "category": item.get("category", ""),
+            "state": item.get("state", "NULL"),
+            "semantic_type": sem_type,
+            "semantic_value": sem_value,
+            "children": []
         }
 
-    def nearest_semantic_ancestor(item):
-        """Läuft die groupNames-Kette hoch (BFS), bis eine Gruppe gefunden
-        wird, die SELBST semantisch getaggt ist. Überspringt dabei rein
-        organisatorische Zwischen-Gruppen ohne eigenes Tag."""
-        visited = set()
-        frontier = list(item.get("groupNames", []))
-        while frontier:
-            gname = frontier.pop(0)
-            if gname in visited:
-                continue
-            visited.add(gname)
-            if gname in tree:
-                return gname
-            parent_item = items_by_name.get(gname)
-            if parent_item:
-                frontier.extend(parent_item.get("groupNames", []))
-        return None
-
+    # 2. Hierarchische Verknüpfung herstellen
     root_nodes = []
-    for item in items:
-        name = item["name"]
-        if name not in tree:
-            continue
-        ancestor_name = nearest_semantic_ancestor(item)
-        if ancestor_name and ancestor_name in tree:
-            tree[ancestor_name]["children"].append(tree[name])
+
+    for name, node in nodes.items():
+        item = items_dict[name]
+        semantics_config = item.get("metadata", {}).get("semantics", {}).get("config", {})
+
+        # Ziel-Elternknoten bestimmen (isPartOf, isPointOf, hasLocation)
+        parent_name = (
+            semantics_config.get("isPartOf") or
+            semantics_config.get("isPointOf") or
+            semantics_config.get("hasLocation")
+        )
+
+        if parent_name and parent_name in nodes:
+            nodes[parent_name]["children"].append(node)
         else:
-            root_nodes.append(tree[name])
+            # Fallback über die normalen groupNames
+            found_parent = False
+            for grp in item.get("groupNames", []):
+                if grp in nodes:
+                    nodes[grp]["children"].append(node)
+                    found_parent = True
+                    break
 
-    return [node for node in root_nodes if node["semantic_type"] == "Location"]
+            if not found_parent:
+                root_nodes.append(node)
+
+    # Nur Locations auf oberster Ebene zurückgeben
+    locations = [node for node in root_nodes if node["semantic_type"] == "Location"]
+    return locations if locations else root_nodes
 
 
-# --- HTML/JS FRONTEND ---
+# --- API Routes ---
+
+@app.route("/api/tree")
+def api_tree():
+    """REST API Route, die den live berechneten Baum ausgibt."""
+    tree = build_semantic_tree()
+    if isinstance(tree, dict) and "error" in tree:
+        return jsonify(tree), 500
+    return jsonify(tree)
+
+
+# --- Web-Interface ---
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="de">
 <head>
     <meta charset="UTF-8">
-    <title>openHAB Semantic Model Viewer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>openHAB Live-Semantik-Baum</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
     <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #f4f6f9;
-            margin: 0;
-            padding: 20px;
-            color: #333;
-        }
-        h1 {
-            color: #1c2d42;
-            border-bottom: 2px solid #34495e;
-            padding-bottom: 10px;
-        }
-        .tree-container {
-            background: white;
-            padding: 20px;
+        body { background-color: #f4f6f9; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .tree-card { border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        
+        /* Tree Styling */
+        .tree, .tree ul { list-style: none; margin: 0; padding: 0; }
+        .tree ul { padding-left: 24px; border-left: 2px dashed #dee2e6; margin-left: 12px; }
+        .tree li { margin: 6px 0; position: relative; }
+        
+        .tree-node {
+            display: flex;
+            align-items: center;
+            padding: 8px 12px;
+            background: #ffffff;
+            border: 1px solid #e9ecef;
             border-radius: 8px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            max-width: 800px;
-            margin: 0 auto;
+            transition: all 0.2s ease;
         }
-        ul {
-            list-style-type: none;
-            padding-left: 20px;
-        }
-        li {
-            margin: 5px 0;
-            position: relative;
-            line-height: 24px;
-        }
-        .caret {
-            cursor: pointer;
-            user-select: none;
-            font-weight: bold;
-            color: #2980b9;
-        }
-        .caret::before {
-            content: "▶ ";
-            display: inline-block;
-            margin-right: 6px;
-            transition: transform 0.2s;
-        }
-        .caret-down::before {
-            transform: rotate(90deg);
-        }
-        .nested {
-            display: none;
-        }
-        .active {
-            display: block;
-        }
-        .badge {
-            font-size: 0.75rem;
-            padding: 2px 6px;
-            border-radius: 4px;
-            margin-left: 10px;
-            font-weight: bold;
-            text-transform: uppercase;
-        }
-        .Location { background-color: #2ecc71; color: white; }
-        .Equipment { background-color: #f1c40f; color: #333; }
-        .Point { background-color: #3498db; color: white; }
-        .property-tag {
-            font-size: 0.75rem;
-            color: #8e44ad;
-            margin-left: 6px;
-        }
-        .item-name {
-            font-size: 0.85rem;
-            color: #7f8c8d;
-            margin-left: 5px;
-        }
-        .debug-link {
-            display: block;
-            margin-top: 15px;
-            font-size: 0.85rem;
-        }
+        .tree-node:hover { background: #f8f9fa; border-color: #ced4da; box-shadow: 0 2px 6px rgba(0,0,0,0.04); }
+        
+        /* Semantik Badges */
+        .badge-Location { background-color: #0d6efd; color: white; }
+        .badge-Equipment { background-color: #198754; color: white; }
+        .badge-Point { background-color: #ffc107; color: #212529; }
+
+        .toggle-icon { cursor: pointer; margin-right: 8px; font-size: 1.1rem; width: 20px; text-align: center; }
+        .item-name { font-size: 0.85rem; color: #6c757d; margin-left: 6px; }
+        .item-state { font-size: 0.85rem; font-weight: 600; color: #495057; margin-left: auto; }
+        .node-details { font-size: 0.75rem; color: #adb5bd; margin-left: 8px; }
     </style>
 </head>
 <body>
 
-<div class="tree-container">
-    <h1>openHAB Semantic Model</h1>
-    <div id="tree">Lade Daten aus openHAB...</div>
-    <a class="debug-link" href="/api/debug" target="_blank">→ /api/debug (Rohdaten zur Fehlersuche)</a>
+<div class="container py-5">
+    <div class="row justify-content-center">
+        <div class="col-lg-10">
+            
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <div>
+                    <h2 class="fw-bold mb-1">openHAB Live-Semantik-Baum</h2>
+                    <p class="text-muted mb-0">Direkte Abfrage über REST API von <code>{{ openhab_url }}</code></p>
+                </div>
+                <button class="btn btn-outline-primary" onclick="loadTree()"><i class="bi bi-arrow-clockwise"></i> Live Aktualisieren</button>
+            </div>
+
+            <!-- Suchfeld & Quick-Actions -->
+            <div class="card tree-card mb-4">
+                <div class="card-body d-flex gap-3">
+                    <input type="text" id="searchInput" class="form-control" placeholder="In Räumen, Geräten oder Points suchen..." onkeyup="filterTree()">
+                    <button class="btn btn-light border text-nowrap" onclick="toggleAll(true)">Alle ausklappen</button>
+                    <button class="btn btn-light border text-nowrap" onclick="toggleAll(false)">Alle einklappen</button>
+                </div>
+            </div>
+
+            <!-- Der Baum -->
+            <div class="card tree-card">
+                <div class="card-body p-4">
+                    <div id="treeContainer">
+                        <div class="text-center py-5">
+                            <div class="spinner-border text-primary" role="status"></div>
+                            <p class="mt-2 text-muted">Lade Daten von openHAB REST-API...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
 </div>
 
 <script>
-    fetch('/api/tree')
-        .then(response => response.json())
-        .then(data => {
-            const treeContainer = document.getElementById('tree');
-            treeContainer.innerHTML = '';
+    let treeData = [];
 
-            if(data.length === 0) {
-                treeContainer.innerHTML = "<p>Keine semantischen Daten gefunden. Siehe /api/debug für Details.</p>";
-                return;
-            }
+    function loadTree() {
+        document.getElementById('treeContainer').innerHTML = `
+            <div class="text-center py-5">
+                <div class="spinner-border text-primary" role="status"></div>
+                <p class="mt-2 text-muted">Frage openHAB REST API ab...</p>
+            </div>`;
 
-            function renderNode(node) {
-                const li = document.createElement('li');
-
-                const spanNode = document.createElement('span');
-                spanNode.textContent = node.label;
-                li.appendChild(spanNode);
-
-                const spanName = document.createElement('span');
-                spanName.className = 'item-name';
-                spanName.textContent = `(${node.name})`;
-                li.appendChild(spanName);
-
-                const badge = document.createElement('span');
-                badge.className = `badge ${node.semantic_type}`;
-                badge.textContent = node.semantic_type;
-                li.appendChild(badge);
-
-                if (node.property) {
-                    const prop = document.createElement('span');
-                    prop.className = 'property-tag';
-                    prop.textContent = `(${node.property})`;
-                    li.appendChild(prop);
+        fetch('/api/tree')
+            .then(res => {
+                if(!res.ok) throw new Error("HTTP Fehler " + res.status);
+                return res.json();
+            })
+            .then(data => {
+                if (data.error) {
+                    throw new Error(data.error);
                 }
-
-                if (node.children && node.children.length > 0) {
-                    spanNode.className = 'caret';
-                    const ul = document.createElement('ul');
-                    ul.className = 'nested';
-
-                    node.children.forEach(child => {
-                        ul.appendChild(renderNode(child));
-                    });
-
-                    li.appendChild(ul);
-
-                    spanNode.addEventListener('click', function() {
-                        this.parentElement.querySelector('.nested').classList.toggle('active');
-                        this.classList.toggle('caret-down');
-                    });
-                }
-
-                return li;
-            }
-
-            const rootUl = document.createElement('ul');
-            data.forEach(rootNode => {
-                rootUl.appendChild(renderNode(rootNode));
+                treeData = data;
+                renderTree();
+            })
+            .catch(err => {
+                document.getElementById('treeContainer').innerHTML = `
+                    <div class="alert alert-danger mb-0">
+                        <h5 class="alert-heading"><i class="bi bi-exclamation-triangle-fill"></i> Fehler</h5>
+                        ${err.message}
+                    </div>`;
             });
-            treeContainer.appendChild(rootUl);
-        })
-        .catch(err => {
-            document.getElementById('tree').innerHTML = "<p style='color:red;'>Fehler beim Laden der Daten: " + err + "</p>";
+    }
+
+    function renderTree() {
+        const container = document.getElementById('treeContainer');
+        if (treeData.length === 0) {
+            container.innerHTML = '<div class="alert alert-warning mb-0">Keine semantischen Knoten gefunden.</div>';
+            return;
+        }
+
+        let html = '<ul class="tree">';
+        for (let root of treeData) {
+            html += createNodeHtml(root);
+        }
+        html += '</ul>';
+        container.innerHTML = html;
+    }
+
+    function createNodeHtml(node) {
+        const hasChildren = node.children && node.children.length > 0;
+        
+        let iconClass = "bi-tag";
+        if (node.semantic_type === "Location") iconClass = "bi-house-door-fill text-primary";
+        if (node.semantic_type === "Equipment") iconClass = "bi-cpu-fill text-success";
+        if (node.semantic_type === "Point") iconClass = "bi-circle-fill text-warning";
+
+        let html = `<li>`;
+        html += `<div class="tree-node">`;
+        
+        if (hasChildren) {
+            html += `<span class="toggle-icon bi bi-chevron-down" onclick="toggleNode(this)"></span>`;
+        } else {
+            html += `<span class="toggle-icon bi bi-dot text-muted"></span>`;
+        }
+
+        html += `<i class="${iconClass} me-2"></i>`;
+        html += `<strong class="me-2">${escapeHtml(node.label)}</strong>`;
+        html += `<span class="badge badge-${node.semantic_type}">${node.semantic_type}</span>`;
+        html += `<span class="node-details">(${escapeHtml(node.semantic_value)})</span>`;
+        html += `<span class="item-name">(${escapeHtml(node.name)})</span>`;
+
+        if (node.state && node.state !== "NULL" && node.state !== "UNDEF") {
+            html += `<span class="item-state badge bg-light text-dark border">${escapeHtml(node.state)}</span>`;
+        }
+
+        html += `</div>`;
+
+        if (hasChildren) {
+            html += `<ul>`;
+            for (let child of node.children) {
+                html += createNodeHtml(child);
+            }
+            html += `</ul>`;
+        }
+
+        html += `</li>`;
+        return html;
+    }
+
+    function toggleNode(element) {
+        const parentLi = element.closest('li');
+        const childUl = parentLi.querySelector('ul');
+        if (childUl) {
+            if (childUl.style.display === "none") {
+                childUl.style.display = "block";
+                element.classList.replace('bi-chevron-right', 'bi-chevron-down');
+            } else {
+                childUl.style.display = "none";
+                element.classList.replace('bi-chevron-down', 'bi-chevron-right');
+            }
+        }
+    }
+
+    function toggleAll(expand) {
+        document.querySelectorAll('.tree ul').forEach(ul => {
+            ul.style.display = expand ? 'block' : 'none';
         });
+        document.querySelectorAll('.toggle-icon.bi-chevron-right, .toggle-icon.bi-chevron-down').forEach(icon => {
+            if (expand) {
+                icon.classList.replace('bi-chevron-right', 'bi-chevron-down');
+            } else {
+                icon.classList.replace('bi-chevron-down', 'bi-chevron-right');
+            }
+        });
+    }
+
+    function filterTree() {
+        const query = document.getElementById('searchInput').value.toLowerCase();
+        const allNodes = document.querySelectorAll('.tree li');
+
+        if (!query) {
+            allNodes.forEach(li => li.style.display = '');
+            return;
+        }
+
+        allNodes.forEach(li => {
+            const text = li.textContent.toLowerCase();
+            if (text.includes(query)) {
+                li.style.display = '';
+                let parent = li.parentElement;
+                while (parent) {
+                    if (parent.tagName === 'UL') parent.style.display = 'block';
+                    if (parent.tagName === 'LI') parent.style.display = '';
+                    parent = parent.parentElement;
+                }
+            } else {
+                li.style.display = 'none';
+            }
+        });
+    }
+
+    function escapeHtml(str) {
+        return str ? str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : '';
+    }
+
+    loadTree();
 </script>
 
 </body>
 </html>
 """
 
-
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
-
-
-@app.route("/api/tree")
-def api_tree():
-    raw_items = get_openhab_items()
-    semantic_tree = build_semantic_tree(raw_items)
-    return jsonify(semantic_tree)
-
-
-@app.route("/api/reload_tags")
-def reload_tags():
-    load_tag_registry()
-    return jsonify({"status": "ok", "tags_loaded": len(_tag_parent)})
-
-
-@app.route("/api/debug")
-def debug():
-    """Zeigt genau das, was wir zur Fehlersuche brauchen, statt weiter zu
-    raten: wie /rest/tags wirklich aussieht, und wie ein paar echte Items
-    damit klassifiziert werden (oder eben nicht)."""
-    raw_items = get_openhab_items()
-    sample = []
-    for item in raw_items:
-        tags = item.get("tags", [])
-        if not tags:
-            continue
-        semantic_type, property_name = classify_item(tags)
-        sample.append({
-            "name": item.get("name"),
-            "type": item.get("type"),
-            "raw_tags": tags,
-            "classified_as": semantic_type,
-            "property": property_name,
-        })
-        if len(sample) >= 20:
-            break
-
-    return jsonify({
-        "tag_registry_entries": len(_tag_parent),
-        "raw_tags_sample": _raw_tags_sample,
-        "items_total": len(raw_items),
-        "items_with_tags_sample": sample,
-    })
+    return render_template_string(HTML_TEMPLATE, openhab_url=OPENHAB_URL)
 
 
 if __name__ == "__main__":
-    load_tag_registry()
+    print(f"Starte Live-Semantik-Viewer unter http://localhost:5000")
     app.run(host="0.0.0.0", port=5000, debug=True)
